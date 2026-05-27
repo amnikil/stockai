@@ -1,0 +1,29 @@
+controller:
+  # Admin credentials
+  adminUser: admin
+  adminPassword: Jenkins@123
+
+  # Pre-install plugins
+  installPlugins:
+    - kubernetes:latest
+    - git:latest
+    - workflow-aggregator:latest    # Pipeline plugin
+    - docker-workflow:latest
+    - aws-credentials:latest
+    - blueocean:latest              # Modern pipeline UI
+    - trivy-scanner:latest
+
+  serviceType: ClusterIP
+
+  # Resource limits
+  resources:
+    requests:
+      cpu: "200m"
+      memory: "512Mi"
+    limits:
+      cpu: "500m"
+      memory: "1Gi"
+
+persistence:
+  enabled: true
+  size: 5Gi

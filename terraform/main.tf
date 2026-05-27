@@ -159,7 +159,7 @@ resource "aws_iam_role_policy_attachment" "eks_cluster_policy" {
 resource "aws_eks_cluster" "main" {
   name     = "stockai-cluster"
   role_arn = aws_iam_role.eks_cluster.arn
-  version  = "1.29"
+  version  = "1.30"
  
   vpc_config {
     # Cluster uses all subnets (public for LB, private for nodes)
@@ -213,7 +213,7 @@ resource "aws_eks_node_group" "main" {
   ami_type       = "AL2_x86_64"   # Amazon Linux 2 (default for EKS)
  
   scaling_config {
-    desired_size = 2   # Run 2 nodes normally
+    desired_size = 3   # Run 2 nodes normally
     min_size     = 1   # Scale down to 1 if needed
     max_size     = 3   # Scale up to 3 under load
   }
