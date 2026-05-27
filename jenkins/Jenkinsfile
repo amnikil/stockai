@@ -1,127 +1,104 @@
 pipeline {
-  agent any
+    agent any
 
-  environment {
-    AWS_REGION            = 'ap-south-1'
-    IMAGE_TAG             = "${env.BUILD_NUMBER}"
-    AWS_ACCESS_KEY_ID     = credentials('aws-access-key-id')
-    AWS_SECRET_ACCESS_KEY = credentials('aws-secret-access-key')
-  }
+    environment {
+        AWS_REGION = 'ap-south-1'
+        IMAGE_TAG = "${env.BUILD_NUMBER}"
 
-  stages {
-
-    stage('Setup Tools') {
-      steps {
-        sh '''
-          # Install AWS CLI to /tmp on every run (survives read-only fs)
-          if [ ! -f /tmp/bin/aws ]; then
-            curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" \
-              -o /tmp/awscliv2.zip
-            cd /tmp && unzip -q awscliv2.zip
-            ./aws/install --install-dir /tmp/aws-cli --bin-dir /tmp/bin
-          fi
-          /tmp/bin/aws --version
-        '''
-      }
+        AWS_ACCESS_KEY_ID     = credentials('aws-access-key-id')
+        AWS_SECRET_ACCESS_KEY = credentials('aws-secret-access-key')
     }
 
-    stage('Checkout') {
-      steps {
-        checkout scm
-        echo "✅ Build #${env.BUILD_NUMBER}"
-      }
-    }
+    stages {
 
-    stage('Detect Changed Service') {
-      steps {
-        script {
-          def changed = sh(
-            script: "git diff --name-only HEAD~1 HEAD 2>/dev/null || echo 'services/'",
-            returnStdout: true
-          ).trim()
-          env.SERVICES_TO_BUILD = changed.contains('api-gateway') ? 'api-gateway' :
-                                   changed.contains('analysis-service') ? 'analysis-service' :
-                                   changed.contains('frontend') ? 'frontend' :
-                                   'api-gateway analysis-service frontend'
-          echo "Building: ${env.SERVICES_TO_BUILD}"
-        }
-      }
-    }
+        stage('Setup Tools') {
+            steps {
+                sh '''
+                    mkdir -p /tmp/tools
+                    cd /tmp/tools
 
-    stage('Get AWS Account ID') {
-      steps {
-        script {
-          env.ACCOUNT_ID = sh(
-            script: "/tmp/bin/aws sts get-caller-identity --query Account --output text",
-            returnStdout: true
-          ).trim()
-          env.ECR_BASE = "${env.ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com"
-          echo "ECR: ${env.ECR_BASE}"
-        }
-      }
-    }
+                    # Install Docker client
+                    if [ ! -f /tmp/docker/docker ]; then
+                        curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-24.0.7.tgz -o docker.tgz
+                        tar -xzf docker.tgz
+                        chmod +x docker/docker
+                    fi
 
-    stage('Build Docker Images') {
-      steps {
-        script {
-          env.SERVICES_TO_BUILD.split(' ').each { service ->
-            sh "cd services/${service} && docker build -t stockai/${service}:${IMAGE_TAG} ."
-          }
-        }
-      }
-    }
+                    # Install AWS CLI
+                    if [ ! -f /tmp/bin/aws ]; then
+                        curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+                        unzip -q awscliv2.zip
+                        ./aws/install --install-dir /tmp/aws-cli --bin-dir /tmp/bin
+                    fi
 
-    stage('Trivy Security Scan') {
-      steps {
-        script {
-          env.SERVICES_TO_BUILD.split(' ').each { service ->
-            sh "trivy image --exit-code 0 --severity HIGH,CRITICAL --no-progress stockai/${service}:${IMAGE_TAG} || true"
-          }
-        }
-      }
-    }
-
-    stage('Push to ECR') {
-      steps {
-        script {
-          sh "/tmp/bin/aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_BASE}"
-          env.SERVICES_TO_BUILD.split(' ').each { service ->
-            sh """
-              docker tag stockai/${service}:${IMAGE_TAG} ${ECR_BASE}/stockai/${service}:${IMAGE_TAG}
-              docker push ${ECR_BASE}/stockai/${service}:${IMAGE_TAG}
-            """
-          }
-        }
-      }
-    }
-
-    stage('Update Helm Tag') {
-      steps {
-        withCredentials([usernamePassword(
-          credentialsId: 'github-credentials',
-          usernameVariable: 'GIT_USER',
-          passwordVariable: 'GIT_TOKEN'
-        )]) {
-          script {
-            env.SERVICES_TO_BUILD.split(' ').each { service ->
-              sh "sed -i 's|tag: .*|tag: \"${IMAGE_TAG}\"|' helm/${service}/values.yaml"
+                    /tmp/docker/docker version
+                    /tmp/bin/aws --version
+                '''
             }
-            sh """
-              git config user.email "jenkins@stockai.com"
-              git config user.name "Jenkins CI"
-              git add helm/
-              git commit -m "ci: build-${IMAGE_TAG} [skip ci]"
-              git push https://${GIT_USER}:${GIT_TOKEN}@github.com/${GIT_USER}/stockai.git HEAD:main
-            """
-          }
         }
-      }
-    }
-  }
 
-  post {
-    success { echo "✅ SUCCESS — ArgoCD deploying build-${IMAGE_TAG}" }
-    failure { echo "❌ FAILED" }
-    always  { sh "docker image prune -f || true" }
-  }
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Get AWS Account ID') {
+            steps {
+                script {
+                    env.ACCOUNT_ID = sh(
+                        script: "/tmp/bin/aws sts get-caller-identity --query Account --output text",
+                        returnStdout: true
+                    ).trim()
+
+                    env.ECR_BASE = "${env.ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com"
+
+                    echo "ECR = ${env.ECR_BASE}"
+                }
+            }
+        }
+
+        stage('Docker Login') {
+            steps {
+                sh """
+                    /tmp/bin/aws ecr get-login-password --region ${AWS_REGION} | \
+                    /tmp/docker/docker login --username AWS --password-stdin ${ECR_BASE}
+                """
+            }
+        }
+
+        stage('Build Image') {
+            steps {
+                sh """
+                    /tmp/docker/docker build -t stockai:${IMAGE_TAG} .
+                """
+            }
+        }
+
+        stage('Tag Image') {
+            steps {
+                sh """
+                    /tmp/docker/docker tag stockai:${IMAGE_TAG} ${ECR_BASE}/stockai:${IMAGE_TAG}
+                """
+            }
+        }
+
+        stage('Push Image') {
+            steps {
+                sh """
+                    /tmp/docker/docker push ${ECR_BASE}/stockai:${IMAGE_TAG}
+                """
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "SUCCESS"
+        }
+
+        failure {
+            echo "FAILED"
+        }
+    }
 }
