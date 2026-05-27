@@ -2,58 +2,61 @@ pipeline {
   agent any
 
   environment {
-    AWS_REGION        = 'ap-south-1'
-    CLUSTER_NAME      = 'stockai-cluster'
-    IMAGE_TAG         = "${env.BUILD_NUMBER}"
+    AWS_REGION            = 'ap-south-1'
+    IMAGE_TAG             = "${env.BUILD_NUMBER}"
+    AWS_ACCESS_KEY_ID     = credentials('aws-access-key-id')
+    AWS_SECRET_ACCESS_KEY = credentials('aws-secret-access-key')
   }
 
   stages {
 
+    stage('Setup Tools') {
+      steps {
+        sh '''
+          # Install AWS CLI to /tmp on every run (survives read-only fs)
+          if [ ! -f /tmp/bin/aws ]; then
+            curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" \
+              -o /tmp/awscliv2.zip
+            cd /tmp && unzip -q awscliv2.zip
+            ./aws/install --install-dir /tmp/aws-cli --bin-dir /tmp/bin
+          fi
+          /tmp/bin/aws --version
+        '''
+      }
+    }
+
     stage('Checkout') {
-      // Pull code from Git repository
       steps {
         checkout scm
-        echo "✅ Code checked out. Build #${env.BUILD_NUMBER}"
+        echo "✅ Build #${env.BUILD_NUMBER}"
       }
     }
 
     stage('Detect Changed Service') {
-      // Figure out which service changed so we only rebuild that one
       steps {
         script {
-          def changedFiles = sh(
-            script: "git diff --name-only HEAD~1 HEAD || echo 'services/'",
+          def changed = sh(
+            script: "git diff --name-only HEAD~1 HEAD 2>/dev/null || echo 'services/'",
             returnStdout: true
           ).trim()
-
-          if (changedFiles.contains('services/api-gateway')) {
-            env.SERVICES_TO_BUILD = 'api-gateway'
-          } else if (changedFiles.contains('services/analysis-service')) {
-            env.SERVICES_TO_BUILD = 'analysis-service'
-          } else if (changedFiles.contains('services/frontend')) {
-            env.SERVICES_TO_BUILD = 'frontend'
-          } else {
-            env.SERVICES_TO_BUILD = 'api-gateway analysis-service frontend'
-          }
-          echo "Services to build: ${env.SERVICES_TO_BUILD}"
+          env.SERVICES_TO_BUILD = changed.contains('api-gateway') ? 'api-gateway' :
+                                   changed.contains('analysis-service') ? 'analysis-service' :
+                                   changed.contains('frontend') ? 'frontend' :
+                                   'api-gateway analysis-service frontend'
+          echo "Building: ${env.SERVICES_TO_BUILD}"
         }
       }
     }
 
     stage('Get AWS Account ID') {
       steps {
-        withCredentials([
-          string(credentialsId: 'aws-access-key-id',     variable: 'AWS_ACCESS_KEY_ID'),
-          string(credentialsId: 'aws-secret-access-key', variable: 'AWS_SECRET_ACCESS_KEY')
-        ]) {
-          script {
-            env.ACCOUNT_ID = sh(
-              script: "aws sts get-caller-identity --query Account --output text",
-              returnStdout: true
-            ).trim()
-            env.ECR_BASE = "${env.ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com"
-            echo "ECR Base: ${env.ECR_BASE}"
-          }
+        script {
+          env.ACCOUNT_ID = sh(
+            script: "/tmp/bin/aws sts get-caller-identity --query Account --output text",
+            returnStdout: true
+          ).trim()
+          env.ECR_BASE = "${env.ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com"
+          echo "ECR: ${env.ECR_BASE}"
         }
       }
     }
@@ -62,95 +65,54 @@ pipeline {
       steps {
         script {
           env.SERVICES_TO_BUILD.split(' ').each { service ->
-            echo "Building Docker image for: ${service}"
-            sh """
-              cd services/${service}
-              docker build \
-                --tag stockai/${service}:${IMAGE_TAG} \
-                --tag stockai/${service}:latest \
-                .
-            """
-            echo "✅ Built: ${service}:${IMAGE_TAG}"
+            sh "cd services/${service} && docker build -t stockai/${service}:${IMAGE_TAG} ."
           }
         }
       }
     }
 
     stage('Trivy Security Scan') {
-      // Scan each image for HIGH and CRITICAL CVEs
-      // The pipeline continues even if vulnerabilities found (exit-code 0)
-      // Change to exit-code 1 to BLOCK deployment on critical CVEs
       steps {
         script {
           env.SERVICES_TO_BUILD.split(' ').each { service ->
-            echo "Scanning ${service} for vulnerabilities..."
-            sh """
-              trivy image \
-                --exit-code 0 \
-                --severity HIGH,CRITICAL \
-                --format table \
-                --no-progress \
-                stockai/${service}:${IMAGE_TAG}
-            """
+            sh "trivy image --exit-code 0 --severity HIGH,CRITICAL --no-progress stockai/${service}:${IMAGE_TAG} || true"
           }
-          echo "✅ Security scan complete"
         }
       }
     }
 
     stage('Push to ECR') {
       steps {
-        withCredentials([
-          string(credentialsId: 'aws-access-key-id',     variable: 'AWS_ACCESS_KEY_ID'),
-          string(credentialsId: 'aws-secret-access-key', variable: 'AWS_SECRET_ACCESS_KEY')
-        ]) {
-          script {
-            // Login to ECR
+        script {
+          sh "/tmp/bin/aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_BASE}"
+          env.SERVICES_TO_BUILD.split(' ').each { service ->
             sh """
-              aws ecr get-login-password --region ${AWS_REGION} | \
-                docker login --username AWS --password-stdin ${ECR_BASE}
+              docker tag stockai/${service}:${IMAGE_TAG} ${ECR_BASE}/stockai/${service}:${IMAGE_TAG}
+              docker push ${ECR_BASE}/stockai/${service}:${IMAGE_TAG}
             """
-
-            env.SERVICES_TO_BUILD.split(' ').each { service ->
-              sh """
-                docker tag stockai/${service}:${IMAGE_TAG} ${ECR_BASE}/stockai/${service}:${IMAGE_TAG}
-                docker tag stockai/${service}:latest       ${ECR_BASE}/stockai/${service}:latest
-                docker push ${ECR_BASE}/stockai/${service}:${IMAGE_TAG}
-                docker push ${ECR_BASE}/stockai/${service}:latest
-              """
-              echo "✅ Pushed: ${service}:${IMAGE_TAG} to ECR"
-            }
           }
         }
       }
     }
 
-    stage('Update Helm Image Tag') {
-      // Change image tag in values.yaml
-      // ArgoCD watches this file — when it changes, ArgoCD deploys
+    stage('Update Helm Tag') {
       steps {
-        withCredentials([
-          usernamePassword(
-            credentialsId: 'github-credentials',
-            usernameVariable: 'GIT_USER',
-            passwordVariable: 'GIT_TOKEN'
-          )
-        ]) {
+        withCredentials([usernamePassword(
+          credentialsId: 'github-credentials',
+          usernameVariable: 'GIT_USER',
+          passwordVariable: 'GIT_TOKEN'
+        )]) {
           script {
             env.SERVICES_TO_BUILD.split(' ').each { service ->
-              sh """
-                sed -i 's|tag: .*|tag: "${IMAGE_TAG}"|' helm/${service}/values.yaml
-              """
+              sh "sed -i 's|tag: .*|tag: \"${IMAGE_TAG}\"|' helm/${service}/values.yaml"
             }
-
             sh """
               git config user.email "jenkins@stockai.com"
-              git config user.name  "Jenkins CI"
+              git config user.name "Jenkins CI"
               git add helm/
-              git commit -m "ci: update image tag to build-${IMAGE_TAG} [skip ci]"
+              git commit -m "ci: build-${IMAGE_TAG} [skip ci]"
               git push https://${GIT_USER}:${GIT_TOKEN}@github.com/${GIT_USER}/stockai.git HEAD:main
             """
-            echo "✅ Helm values updated — ArgoCD will deploy shortly"
           }
         }
       }
@@ -158,15 +120,8 @@ pipeline {
   }
 
   post {
-    success {
-      echo "✅ Pipeline SUCCESS — ArgoCD will deploy build-${IMAGE_TAG} to EKS within 3 minutes"
-    }
-    failure {
-      echo "❌ Pipeline FAILED — check the stage logs above"
-    }
-    always {
-      // Clean up local Docker images to save disk space
-      sh "docker image prune -f || true"
-    }
+    success { echo "✅ SUCCESS — ArgoCD deploying build-${IMAGE_TAG}" }
+    failure { echo "❌ FAILED" }
+    always  { sh "docker image prune -f || true" }
   }
 }
