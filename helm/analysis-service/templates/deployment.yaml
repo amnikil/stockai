@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: analysis-service
+  namespace: stockai
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: analysis-service
+  template:
+    metadata:
+      labels:
+        app: analysis-service
+    spec:
+      containers:
+      - name: analysis-service
+        image: 043189681434.dkr.ecr.ap-south-1.amazonaws.com/stockai/analysis-service:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 3000
+        env:
+        - name: RAILS_ENV
+          value: "production"
+        - name: RAILS_LOG_TO_STDOUT
+          value: "true"
+        - name: SECRET_KEY_BASE
+          valueFrom:
+            secretKeyRef:
+              name: stockai-secrets
+              key: secret-key-base
+        - name: ANTHROPIC_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: stockai-secrets
+              key: anthropic-api-key
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "300m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 60
+          periodSeconds: 15
+          failureThreshold: 5
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 3000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          failureThreshold: 5
